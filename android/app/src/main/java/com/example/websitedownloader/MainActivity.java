@@ -1,58 +1,48 @@
 package com.example.websitedownloader;
 
 import android.Manifest;
+import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
-import android.util.Pair;
 import android.view.View;
-import android.webkit.MimeTypeMap;
 import android.widget.Button;
+import android.widget.CheckBox; // Added
 import android.widget.EditText;
+import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
-
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.nio.file.Files;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.Queue;
-import java.util.Set;
-import java.util.UUID;
-
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final int STORAGE_PERMISSION_CODE = 101;
     private static final String TAG = "MainActivity";
-    private static final int MAX_DEPTH = 1; // Max recursion depth for downloading linked resources
 
     EditText urlEditText;
+    EditText depthEditText;
+    CheckBox includeSubdomainsCheckBox; // Added
     Button downloadButton;
+    Button cancelButton;
+    Button clearDownloadsButton;
+    ProgressBar downloadProgressBar;
     TextView logTextView;
+    ScrollView logScrollView;
 
-    private OkHttpClient httpClient;
+    private DownloadBroadcastReceiver downloadReceiver;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -60,50 +50,170 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         urlEditText = findViewById(R.id.urlEditText);
+        depthEditText = findViewById(R.id.depthEditText);
+        includeSubdomainsCheckBox = findViewById(R.id.includeSubdomainsCheckBox); // Added
         downloadButton = findViewById(R.id.downloadButton);
+        cancelButton = findViewById(R.id.cancelButton);
+        clearDownloadsButton = findViewById(R.id.clearDownloadsButton);
+        downloadProgressBar = findViewById(R.id.downloadProgressBar);
         logTextView = findViewById(R.id.logTextView);
-
-        httpClient = new OkHttpClient();
+        logScrollView = findViewById(R.id.logScrollView);
 
         downloadButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startDownloadProcess();
+                startDownloadService();
             }
         });
+
+        cancelButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Intent cancelIntent = new Intent(MainActivity.this, DownloadService.class);
+                cancelIntent.setAction(DownloadService.ACTION_CANCEL_DOWNLOAD);
+                startService(cancelIntent);
+                appendToLog("Cancellation signal sent to service...");
+                cancelButton.setEnabled(false);
+            }
+        });
+
+        clearDownloadsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showClearConfirmationDialog();
+            }
+        });
+
+        downloadReceiver = new DownloadBroadcastReceiver();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(DownloadService.ACTION_DOWNLOAD_STATUS_UPDATE);
+        ContextCompat.registerReceiver(this, downloadReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
-    private void startDownloadProcess() {
-        logTextView.setText(""); // Clear previous logs
+    private void showClearConfirmationDialog() {
+        new AlertDialog.Builder(this)
+            .setTitle("Confirm Clear")
+            .setMessage("Are you sure you want to delete all downloaded websites? This action cannot be undone.")
+            .setPositiveButton("Clear", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface dialog, int which) {
+                    performClearDownloads();
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .setIcon(android.R.drawable.ic_dialog_alert)
+            .show();
+    }
+
+    private void performClearDownloads() {
+        File downloadsDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (downloadsDir != null && downloadsDir.exists()) {
+            if (deleteRecursive(downloadsDir)) {
+                Toast.makeText(this, "All downloads cleared.", Toast.LENGTH_SHORT).show();
+                appendToLog("All downloaded files have been cleared.");
+            } else {
+                Toast.makeText(this, "Failed to clear all downloads.", Toast.LENGTH_SHORT).show();
+                appendToLog("Error: Failed to clear all downloaded files.");
+            }
+        } else {
+            Toast.makeText(this, "No downloads directory found or accessible.", Toast.LENGTH_SHORT).show();
+            appendToLog("Info: No downloads directory found to clear.");
+        }
+    }
+
+    private boolean deleteRecursive(File fileOrDirectory) {
+        if (fileOrDirectory.isDirectory()) {
+            File[] children = fileOrDirectory.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    if (!deleteRecursive(child)) {
+                        Log.e(TAG, "Failed to delete: " + child.getAbsolutePath());
+                    }
+                }
+            }
+        }
+        return fileOrDirectory.delete();
+    }
+
+
+    private void startDownloadService() {
+        logTextView.setText("");
+
+        final boolean includeSubdomains = includeSubdomainsCheckBox.isChecked(); // Read CheckBox state
+
+        runOnUiThread(() -> {
+            downloadProgressBar.setVisibility(View.VISIBLE);
+            downloadProgressBar.setIndeterminate(true);
+            downloadButton.setEnabled(false);
+            cancelButton.setVisibility(View.VISIBLE);
+            cancelButton.setEnabled(true);
+            urlEditText.setEnabled(false);
+            depthEditText.setEnabled(false);
+            includeSubdomainsCheckBox.setEnabled(false); // Disable CheckBox
+            clearDownloadsButton.setEnabled(false);
+        });
+
         String initialUrlString = urlEditText.getText().toString().trim();
+        String depthString = depthEditText.getText().toString().trim();
+        int userMaxDepth;
 
         if (initialUrlString.isEmpty()) {
             appendToLog("Error: URL cannot be empty.");
+            resetUiAfterDownload("URL_EMPTY");
             return;
         }
 
-        URL validatedInitialUrl;
         try {
-            validatedInitialUrl = new URL(initialUrlString); // Validate URL format
-            if (!validatedInitialUrl.getProtocol().startsWith("http")) {
-                 appendToLog("Error: URL must start with http:// or https://");
-                 return;
+            userMaxDepth = Integer.parseInt(depthString);
+            if (userMaxDepth < 0) {
+                appendToLog("Info: Recursion depth cannot be negative. Using default depth of 0.");
+                userMaxDepth = 0;
+            } else if (userMaxDepth > 5) {
+                appendToLog("Info: Recursion depth capped at 5 for safety. Using depth 5.");
+                userMaxDepth = 5;
             }
-        } catch (MalformedURLException e) {
-            appendToLog("Error: Invalid URL format. Please include http:// or https://");
-            Log.e(TAG, "Invalid URL format", e);
-            return;
+        } catch (NumberFormatException e) {
+            appendToLog("Info: Invalid depth input. Using default depth of 0.");
+            userMaxDepth = 0;
         }
 
         if (checkPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, STORAGE_PERMISSION_CODE)) {
-            executeDownload(validatedInitialUrl.toString());
+            Intent serviceIntent = new Intent(this, DownloadService.class);
+            serviceIntent.putExtra("URL", initialUrlString);
+            serviceIntent.putExtra("DEPTH", userMaxDepth);
+            serviceIntent.putExtra("INCLUDE_SUBDOMAINS", includeSubdomains); // Add boolean extra
+            startService(serviceIntent);
+            appendToLog("Download service initiated (Include Subdomains: " + includeSubdomains + ")");
+        } else {
+            appendToLog("Storage permission pending...");
+            runOnUiThread(() -> {
+                downloadProgressBar.setVisibility(View.GONE);
+                downloadButton.setEnabled(true);
+                cancelButton.setVisibility(View.GONE);
+                cancelButton.setEnabled(false);
+                urlEditText.setEnabled(true);
+                depthEditText.setEnabled(true);
+                includeSubdomainsCheckBox.setEnabled(true); // Re-enable CheckBox
+                clearDownloadsButton.setEnabled(true);
+            });
         }
+    }
+
+    private void resetUiAfterDownload(String status) {
+        runOnUiThread(() -> {
+            downloadProgressBar.setVisibility(View.GONE);
+            downloadButton.setEnabled(true);
+            cancelButton.setVisibility(View.GONE);
+            cancelButton.setEnabled(false);
+            urlEditText.setEnabled(true);
+            depthEditText.setEnabled(true);
+            includeSubdomainsCheckBox.setEnabled(true); // Re-enable CheckBox
+            clearDownloadsButton.setEnabled(true);
+        });
     }
 
     private boolean checkPermission(String permission, int requestCode) {
         if (ContextCompat.checkSelfPermission(MainActivity.this, permission) == PackageManager.PERMISSION_DENIED) {
             ActivityCompat.requestPermissions(MainActivity.this, new String[]{permission}, requestCode);
-            appendToLog("Storage permission requested...");
             return false;
         }
         return true;
@@ -114,213 +224,11 @@ public class MainActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == STORAGE_PERMISSION_CODE) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                appendToLog("Storage Permission Granted. Starting download...");
-                String urlString = urlEditText.getText().toString().trim();
-                if (!urlString.isEmpty()) {
-                    try {
-                        URL validatedUrl = new URL(urlString);
-                         executeDownload(validatedUrl.toString());
-                    } catch (MalformedURLException e) {
-                         appendToLog("Error: Invalid URL format after permission grant.");
-                    }
-                } else {
-                    appendToLog("Error: URL was empty after permission grant.");
-                }
+                appendToLog("Storage Permission Granted. You can now start the download.");
             } else {
-                appendToLog("Storage Permission Denied. Cannot download files.");
+                appendToLog("Storage Permission Denied. Cannot start download or clear files effectively.");
+                resetUiAfterDownload(DownloadService.STATUS_ERROR);
             }
-        }
-    }
-
-    private void executeDownload(final String initialUrl) {
-        appendToLog("Preparing to download from: " + initialUrl);
-
-        final File baseDownloadDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-        if (baseDownloadDir == null) {
-            appendToLog("Error: External storage for downloads is not available.");
-            return;
-        }
-        if (!baseDownloadDir.exists() && !baseDownloadDir.mkdirs()) {
-            appendToLog("Error: Could not create base download directory: " + baseDownloadDir.getAbsolutePath());
-            return;
-        }
-
-        // Create a unique subdirectory for this download session based on initial URL's host
-        String host;
-        try {
-            host = new URL(initialUrl).getHost();
-        } catch (MalformedURLException e) {
-            host = "unknown_host";
-        }
-        final File siteSpecificDir = new File(baseDownloadDir, host.replaceAll("[^a-zA-Z0-9.-]", "_"));
-        if (!siteSpecificDir.exists() && !siteSpecificDir.mkdirs()) {
-            appendToLog("Error: Could not create site-specific download directory: " + siteSpecificDir.getAbsolutePath());
-            return;
-        }
-        appendToLog("Download path: " + siteSpecificDir.getAbsolutePath());
-
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                Set<String> visitedUrls = new HashSet<>();
-                Queue<Pair<String, Integer>> urlQueue = new LinkedList<>();
-
-                urlQueue.add(new Pair<>(initialUrl, 0));
-
-                while (!urlQueue.isEmpty()) {
-                    Pair<String, Integer> currentEntry = urlQueue.poll();
-                    String currentUrlString = currentEntry.first;
-                    int currentDepth = currentEntry.second;
-
-                    if (currentDepth > MAX_DEPTH || !visitedUrls.add(currentUrlString)) {
-                        if (currentDepth > MAX_DEPTH) appendToLog("Max depth reached for: " + currentUrlString);
-                        else appendToLog("Already visited: " + currentUrlString);
-                        continue;
-                    }
-
-                    URL currentUrlObj;
-                    try {
-                        currentUrlObj = new URL(currentUrlString);
-                    } catch (MalformedURLException e) {
-                        appendToLog("Skipping invalid URL in queue: " + currentUrlString);
-                        continue;
-                    }
-
-                    appendToLog("Processing (Depth " + currentDepth + "): " + currentUrlString);
-                    Request request = new Request.Builder().url(currentUrlObj).build();
-
-                    try (Response response = httpClient.newCall(request).execute()) { // Synchronous call in background thread
-                        if (!response.isSuccessful()) {
-                            appendToLog("Failed: " + currentUrlString + " (" + response.code() + " " + response.message() + ")");
-                            continue;
-                        }
-
-                        ResponseBody body = response.body();
-                        if (body == null) {
-                            appendToLog("Empty response body: " + currentUrlString);
-                            continue;
-                        }
-
-                        String filename = extractFilename(currentUrlString, response);
-                        File outputFile = new File(siteSpecificDir, filename);
-
-                        // Ensure parent directories for nested resources exist
-                        File parentDir = outputFile.getParentFile();
-                        if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs()) {
-                            appendToLog("Error creating parent directory for: " + outputFile.getAbsolutePath());
-                            continue;
-                        }
-
-
-                        try (InputStream inputStream = body.byteStream();
-                             FileOutputStream outputStream = new FileOutputStream(outputFile)) {
-                            byte[] buffer = new byte[8192];
-                            int bytesRead;
-                            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                                outputStream.write(buffer, 0, bytesRead);
-                            }
-                        }
-                        appendToLog("Saved: " + outputFile.getName() + " (Size: " + outputFile.length() + " bytes)");
-
-                        String contentType = response.header("Content-Type");
-                        if (contentType != null && contentType.toLowerCase().contains("text/html") && currentDepth < MAX_DEPTH) {
-                            // Re-read the saved file to parse with Jsoup
-                            String htmlContent;
-                            try {
-                                htmlContent = new String(Files.readAllBytes(outputFile.toPath()));
-                            } catch (OutOfMemoryError oom) {
-                                appendToLog("File too large to parse for links: " + outputFile.getName());
-                                continue;
-                            }
-
-                            Document doc = Jsoup.parse(htmlContent, currentUrlString);
-                            Elements links = doc.select("a[href], img[src], link[href], script[src]");
-
-                            for (Element link : links) {
-                                String attr = link.hasAttr("href") ? "href" : "src";
-                                String absoluteUrl = link.absUrl(attr); // Jsoup handles relative to absolute conversion
-
-                                if (isValidToFollow(absoluteUrl, initialUrl)) {
-                                    urlQueue.add(new Pair<>(absoluteUrl, currentDepth + 1));
-                                    // appendToLog("Queued: " + absoluteUrl);
-                                }
-                            }
-                        }
-                    } catch (IOException e) {
-                        appendToLog("Error processing " + currentUrlString + ": " + e.getMessage());
-                        Log.e(TAG, "IOException for " + currentUrlString, e);
-                    } catch (Exception e) {
-                        appendToLog("Unexpected error for " + currentUrlString + ": " + e.getMessage());
-                        Log.e(TAG, "Unexpected error for " + currentUrlString, e);
-                    }
-                } // End while loop
-                appendToLog("Download process finished.");
-            }
-        }).start();
-    }
-
-    private String extractFilename(String urlString, Response response) {
-        String filename = null;
-        String contentDisposition = response.header("Content-Disposition");
-        if (contentDisposition != null) {
-            String[] parts = contentDisposition.split("filename=");
-            if (parts.length > 1) {
-                filename = parts[1].replace("\"", "").trim();
-            }
-        }
-
-        if (filename == null) {
-            try {
-                URL url = new URL(urlString);
-                String path = url.getPath();
-                if (path.endsWith("/")) { // Handle directory-like URLs
-                    filename = "index.html"; // Default for directory-like URLs
-                } else {
-                    filename = new File(path).getName();
-                    if (filename.isEmpty()) filename = "index.html"; // if path was just "/"
-                }
-            } catch (MalformedURLException e) {
-                filename = UUID.randomUUID().toString(); // Fallback for malformed URLs
-            }
-        }
-
-        // Ensure filename has an extension if possible, otherwise use a default or derived one
-        if (!filename.contains(".")) {
-            String contentType = response.header("Content-Type");
-            String extension = null;
-            if (contentType != null) {
-                extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(contentType.split(";")[0].trim());
-            }
-            if (extension != null) {
-                filename += "." + extension;
-            } else if (contentType != null && contentType.toLowerCase().contains("text/html")) {
-                 filename += ".html"; // Default for HTML if MIME type is generic
-            } else {
-                // If no extension can be derived, and it's not index.html already
-                // (e.g. from a path like /about/), and it's likely HTML, append .html
-                if (filename.equals(new File(urlString).getName()) && (urlString.endsWith("/") || !urlString.substring(urlString.lastIndexOf("/") + 1).contains("."))) {
-                     // This logic might be too aggressive, but aims to save "domain.com/about" as "about.html"
-                     // filename += ".html";
-                }
-            }
-        }
-        // Sanitize filename (basic)
-        filename = filename.replaceAll("[^a-zA-Z0-9._-]+", "_");
-        if (filename.length() > 100) filename = filename.substring(0,100); // Max length
-
-        return filename;
-    }
-
-    private boolean isValidToFollow(String nextUrl, String initialUrl) {
-        if (nextUrl == null || nextUrl.trim().isEmpty()) return false;
-        try {
-            URL next = new URL(nextUrl);
-            URL initial = new URL(initialUrl);
-            // Only follow http/https and same host
-            return next.getProtocol().matches("^https?$" ) && next.getHost().equalsIgnoreCase(initial.getHost());
-        } catch (MalformedURLException e) {
-            return false;
         }
     }
 
@@ -330,7 +238,47 @@ public class MainActivity extends AppCompatActivity {
             public void run() {
                 logTextView.append(message + "\n");
                 Log.d(TAG, message);
+                if (logScrollView != null) {
+                    logScrollView.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            logScrollView.fullScroll(View.FOCUS_DOWN);
+                        }
+                    });
+                }
             }
         });
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (downloadReceiver != null) {
+            unregisterReceiver(downloadReceiver);
+        }
+    }
+
+    private class DownloadBroadcastReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String logMessage = intent.getStringExtra(DownloadService.EXTRA_LOG_MESSAGE);
+            if (logMessage != null) {
+                appendToLog(logMessage);
+            }
+
+            String status = intent.getStringExtra(DownloadService.EXTRA_DOWNLOAD_STATUS);
+            if (status != null) {
+                switch (status) {
+                    case DownloadService.STATUS_COMPLETE:
+                    case DownloadService.STATUS_ERROR:
+                    case DownloadService.STATUS_CANCELLED:
+                        resetUiAfterDownload(status);
+                        break;
+                    case DownloadService.STATUS_PROGRESS:
+                    case DownloadService.STATUS_STARTING:
+                        break;
+                }
+            }
+        }
     }
 }

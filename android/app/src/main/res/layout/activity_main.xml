@@ -15,6 +15,21 @@
         android:hint="Enter website URL"
         android:inputType="textUri" />
 
+    <EditText
+        android:id="@+id/depthEditText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:hint="Recursion Depth (e.g., 1)"
+        android:inputType="number" />
+
+    <CheckBox
+        android:id="@+id/includeSubdomainsCheckBox"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="Include Subdomains" />
+
     <Button
         android:id="@+id/downloadButton"
         android:layout_width="wrap_content"
@@ -22,6 +37,34 @@
         android:layout_gravity="center_horizontal"
         android:layout_marginTop="8dp"
         android:text="Download" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical">
+
+        <Button
+            android:id="@+id/cancelButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Cancel"
+            android:visibility="gone"
+            tools:visibility="visible" /> <!-- For layout preview -->
+
+        <ProgressBar
+            android:id="@+id/downloadProgressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:indeterminate="true"
+            android:visibility="gone"
+            tools:visibility="visible" /> <!-- For layout preview -->
+
+    </LinearLayout>
 
     <ScrollView
         android:id="@+id/logScrollView"
@@ -39,5 +82,13 @@
             android:textAppearance="@style/TextAppearance.AppCompat.Small"
             android:textIsSelectable="true" />
     </ScrollView>
+
+    <Button
+        android:id="@+id/clearDownloadsButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="16dp"
+        android:text="Clear All Downloads" />
 
 </LinearLayout>
