@@ -1,2 +1,0 @@
-# This is a placeholder for the wget native binary for arm64-v8a.
-# In a real build, this file would be the compiled wget executable.
