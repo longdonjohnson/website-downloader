@@ -38,7 +38,8 @@ APP_NAME="Gradle"
 APP_BASE_NAME=`basename "$0"`
 
 # Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
-DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+# Define defaults for direct use in sh string concatenation
+DEFAULT_JVM_OPTS_STR="-Xmx64m -Xms64m"
 
 # Use a constant for the wrapper JAR path
 WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
@@ -65,23 +66,25 @@ Please set the JAVA_HOME variable in your environment to match the
 location of your Java installation."
 fi
 
-# Escape application args
-save () {
-    for i do
-        printf %s\n "$i" | sed "s/'/'\\''/g;s/\"/\\\"/g"
-    done
-}
-APP_ARGS_ESCAPED=`save "$@"`
+# Construct the JVM_OPTS string
+# Start with defaults
+JVM_OPTS_ACCUMULATED="$DEFAULT_JVM_OPTS_STR"
 
-# Split up the JVM options only if spaces are available.
-# Otherwise treat them as single argument.
-if echo "$DEFAULT_JVM_OPTS" | grep -q ' '; then
-    JVM_OPTS=($DEFAULT_JVM_OPTS)
-else
-    JVM_OPTS=("$DEFAULT_JVM_OPTS")
+# Append JAVA_OPTS, if set. User must ensure it's quoted correctly if it contains spaces.
+if [ -n "$JAVA_OPTS" ]; then
+  JVM_OPTS_ACCUMULATED="$JVM_OPTS_ACCUMULATED $JAVA_OPTS"
 fi
-JVM_OPTS=(${JVM_OPTS[@]} ${JAVA_OPTS[@]} ${GRADLE_OPTS[@]})
-# Add specific JVM options that should always be there.
-JVM_OPTS=(${JVM_OPTS[@]} "-Dorg.gradle.appname=$APP_BASE_NAME")
 
-exec "$JAVACMD" "${JVM_OPTS[@]}" -jar "$WRAPPER_JAR" $APP_ARGS_ESCAPED
+# Append GRADLE_OPTS, if set. User must ensure it's quoted correctly if it contains spaces.
+if [ -n "$GRADLE_OPTS" ]; then
+  JVM_OPTS_ACCUMULATED="$JVM_OPTS_ACCUMULATED $GRADLE_OPTS"
+fi
+
+# Add specific JVM options that should always be there.
+# APP_BASE_NAME generally does not have spaces.
+JVM_OPTS_ACCUMULATED="$JVM_OPTS_ACCUMULATED -Dorg.gradle.appname=$APP_BASE_NAME"
+
+# Standard exec line:
+# Pass JVM_OPTS_ACCUMULATED unquoted to allow word splitting by the shell.
+# Pass "$@" to preserve arguments to the script.
+exec "$JAVACMD" $JVM_OPTS_ACCUMULATED -jar "$WRAPPER_JAR" "$@"
