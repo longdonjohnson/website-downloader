@@ -4,10 +4,12 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Environment;
 import android.os.IBinder;
+import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
 import android.webkit.MimeTypeMap;
 
+import androidx.annotation.NonNull; // Added for Interceptor
 import androidx.annotation.Nullable;
 
 import org.jsoup.Jsoup;
@@ -19,12 +21,15 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.MalformedURLException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.DecimalFormat;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -32,8 +37,11 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
+
 import javax.net.ssl.SSLException;
 
+import okhttp3.Interceptor; // Added
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -56,9 +64,10 @@ public class DownloadService extends Service {
     public static final String STATUS_CANCELLED = "CANCELLED";
     public static final String STATUS_STARTING = "STARTING";
 
-    // Extra for includeSubdomains
     public static final String EXTRA_INCLUDE_SUBDOMAINS = "INCLUDE_SUBDOMAINS";
 
+    // Define User-Agent String
+    private static final String COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36";
 
     private OkHttpClient httpClient;
     private Queue<Pair<String, Integer>> urlQueue;
@@ -67,17 +76,34 @@ public class DownloadService extends Service {
     private volatile boolean isCancelled = false;
     private Thread downloadThread;
     private int currentStartId;
-    private boolean currentIncludeSubdomainsFlag = false; // Store the flag for the current download session
+    private boolean currentIncludeSubdomainsFlag = false;
+
+    private static final Pattern ILLEGAL_FILENAME_CHARS = Pattern.compile("[\\\\/:*?\"<>|\\x00-\\x1F\\x7F]");
+    private static final int MAX_FILENAME_LENGTH = 150;
+    private static final int MAX_PATH_SEGMENT_LENGTH = 100;
 
 
     @Override
     public void onCreate() {
         super.onCreate();
-        httpClient = new OkHttpClient.Builder().build();
+        // Modify OkHttpClient Initialization to add User-Agent Interceptor
+        httpClient = new OkHttpClient.Builder()
+                .addInterceptor(new Interceptor() {
+                    @NonNull
+                    @Override
+                    public Response intercept(Chain chain) throws IOException {
+                        Request originalRequest = chain.request();
+                        Request requestWithUserAgent = originalRequest.newBuilder()
+                                .header("User-Agent", COMMON_USER_AGENT)
+                                .build();
+                        return chain.proceed(requestWithUserAgent);
+                    }
+                })
+                .build();
         urlQueue = new LinkedList<>();
         visitedUrls = new HashSet<>();
         downloadedResourcePaths = new HashMap<>();
-        Log.d(TAG, "Service Created");
+        Log.d(TAG, "Service Created with User-Agent Interceptor");
     }
 
     @Override
@@ -100,7 +126,7 @@ public class DownloadService extends Service {
 
         final String url = intent != null ? intent.getStringExtra("URL") : null;
         final int depth = intent != null ? intent.getIntExtra("DEPTH", 0) : 0;
-        currentIncludeSubdomainsFlag = intent != null && intent.getBooleanExtra(EXTRA_INCLUDE_SUBDOMAINS, false); // Retrieve and store
+        currentIncludeSubdomainsFlag = intent != null && intent.getBooleanExtra(EXTRA_INCLUDE_SUBDOMAINS, false);
 
         if (url == null || url.isEmpty()) {
             sendUpdateBroadcast("Error: URL is null or empty.", STATUS_ERROR, "URL missing");
@@ -108,7 +134,9 @@ public class DownloadService extends Service {
             return START_NOT_STICKY;
         }
 
-        sendUpdateBroadcast("Download starting (Include Subdomains: " + currentIncludeSubdomainsFlag + ") for URL: " + url + " with depth: " + depth, STATUS_STARTING, null);
+        // Log User-Agent once per new download session
+        sendUpdateBroadcast("Using User-Agent: " + COMMON_USER_AGENT, STATUS_PROGRESS, null);
+        sendUpdateBroadcast("Download starting (Subdomains: " + (currentIncludeSubdomainsFlag?"Yes":"No") + ", Depth: "+depth+") for: " + url, STATUS_STARTING, null);
 
         isCancelled = false;
         visitedUrls.clear();
@@ -133,7 +161,7 @@ public class DownloadService extends Service {
                     throw new IOException("Initial URL is malformed: " + e.getMessage());
                 }
 
-                final String siteSpecificDirName = host.replaceAll("[^a-zA-Z0-9.-]", "_");
+                final String siteSpecificDirName = sanitizePathComponent(host);
                 final File siteSpecificDirFile = new File(baseDownloadDir, siteSpecificDirName);
                 if (!siteSpecificDirFile.exists() && !siteSpecificDirFile.mkdirs()) {
                      throw new IOException("Could not create site-specific directory: " + siteSpecificDirFile.getAbsolutePath());
@@ -145,36 +173,47 @@ public class DownloadService extends Service {
                     String currentUrlString = currentEntry.first;
                     int currentDepth = currentEntry.second;
 
+                    sendUpdateBroadcast("Dequeued (Depth " + currentDepth + "/" + depth + "): " + currentUrlString, STATUS_PROGRESS, null);
+
+
                     if (isCancelled) { finalStatus = STATUS_CANCELLED; break; }
 
-                    if (currentDepth > depth || !visitedUrls.add(currentUrlString)) {
-                        if (currentDepth > depth) sendUpdateBroadcast("Max depth (" + depth + ") reached for: " + currentUrlString, STATUS_PROGRESS, null);
+                    if (visitedUrls.contains(currentUrlString)) {
+                        sendUpdateBroadcast("Skipping (already visited): " + currentUrlString, STATUS_PROGRESS, null);
                         continue;
                     }
+                    if (currentDepth > depth) {
+                        sendUpdateBroadcast("Skipping (max depth " + depth + " exceeded): " + currentUrlString, STATUS_PROGRESS, null);
+                        continue;
+                    }
+                    visitedUrls.add(currentUrlString);
+
 
                     URL currentUrlObj;
                     try {
                         currentUrlObj = new URL(currentUrlString);
                     } catch (MalformedURLException e) {
                         Log.w(TAG, "Malformed URL in queue: " + currentUrlString, e);
-                        sendUpdateBroadcast("Skipping invalid URL: " + currentUrlString, STATUS_PROGRESS, null);
+                        sendUpdateBroadcast("Skipping (malformed URL): " + currentUrlString, STATUS_PROGRESS, null);
                         continue;
                     }
 
                     if (isCancelled) { finalStatus = STATUS_CANCELLED; break; }
-                    sendUpdateBroadcast("Processing (Depth " + currentDepth + "/" + depth + "): " + currentUrlString, STATUS_PROGRESS, null);
+                    sendUpdateBroadcast("Attempting to download: " + currentUrlString, STATUS_PROGRESS, null);
+                    // Request will now include User-Agent via the interceptor
                     Request request = new Request.Builder().url(currentUrlObj).build();
+
 
                     try (Response response = httpClient.newCall(request).execute()) {
                         if (isCancelled) { finalStatus = STATUS_CANCELLED; break;}
 
                         if (!response.isSuccessful()) {
-                            sendUpdateBroadcast("Failed: " + currentUrlString + " (" + response.code() + " " + response.message() + ")", STATUS_PROGRESS, null);
+                            sendUpdateBroadcast("Failed download: " + currentUrlString + " (" + response.code() + " " + response.message() + ")", STATUS_PROGRESS, null);
                             continue;
                         }
                         ResponseBody body = response.body();
                         if (body == null) {
-                            sendUpdateBroadcast("Empty response for: " + currentUrlString, STATUS_PROGRESS, null);
+                            sendUpdateBroadcast("Empty response body for: " + currentUrlString, STATUS_PROGRESS, null);
                             continue;
                         }
 
@@ -205,14 +244,15 @@ public class DownloadService extends Service {
 
                         if (!isCancelled) {
                             downloadedResourcePaths.put(currentUrlString, relativePath);
-                            sendUpdateBroadcast("Saved: " + relativePath + " (" + outputFile.length() + " bytes)", STATUS_PROGRESS, null);
+                            sendUpdateBroadcast("Saved: " + outputFile.getAbsolutePath() + " (" + formatFileSize(outputFile.length()) + ")", STATUS_PROGRESS, null);
                         }
 
                         String contentType = response.header("Content-Type");
                         if (!isCancelled && contentType != null && contentType.toLowerCase().contains("text/html")) {
+                            sendUpdateBroadcast("Parsing HTML for links: " + relativePath, STATUS_PROGRESS, null);
                             String htmlContent = "";
                             try {
-                                htmlContent = new String(Files.readAllBytes(outputFile.toPath()));
+                                htmlContent = new String(Files.readAllBytes(outputFile.toPath()), "UTF-8");
                             } catch (OutOfMemoryError oom) {
                                 Log.e(TAG, "OutOfMemoryError reading HTML file for parsing: " + relativePath, oom);
                                 sendUpdateBroadcast("File too large to parse for links: " + relativePath, STATUS_PROGRESS, null);
@@ -228,30 +268,58 @@ public class DownloadService extends Service {
                                 continue;
                             }
 
-                            Elements links = doc.select("a[href], img[src], link[href], script[src]");
+                            String selector = "a[href], link[href], script[src], img[src], source[src], track[src], iframe[src], object[data], embed[src]";
+                            Elements links = doc.select(selector);
                             Path currentHtmlFileDirPath = outputFile.getParentFile().toPath();
                             boolean modified = false;
+                            int linksRewrittenCount = 0;
+                            int newLinksAddedCount = 0;
 
+                            sendUpdateBroadcast("Rewriting links in: " + relativePath, STATUS_PROGRESS, null);
                             for (Element link : links) {
                                 if (isCancelled) { finalStatus = STATUS_CANCELLED; break; }
-                                String attrToChange = link.hasAttr("href") ? "href" : (link.hasAttr("src") ? "src" : null);
-                                if (attrToChange == null) continue;
+
+                                String attrToChange = "";
+                                if (link.hasAttr("href")) {
+                                    attrToChange = "href";
+                                } else if (link.hasAttr("src")) {
+                                    attrToChange = "src";
+                                } else if (link.tagName().equals("object") && link.hasAttr("data")) {
+                                    attrToChange = "data";
+                                } else {
+                                    continue;
+                                }
 
                                 String absoluteLinkUrl = link.absUrl(attrToChange);
+                                if (absoluteLinkUrl.isEmpty()) {
+                                    continue;
+                                }
+
                                 if (downloadedResourcePaths.containsKey(absoluteLinkUrl)) {
                                     String targetLocalRelativePath = downloadedResourcePaths.get(absoluteLinkUrl);
                                     File targetFile = new File(siteSpecificDirFile, targetLocalRelativePath);
-                                    Path relativePathToTarget = currentHtmlFileDirPath.relativize(targetFile.toPath());
-                                    link.attr(attrToChange, relativePathToTarget.toString().replace(File.separatorChar, '/'));
-                                    modified = true;
+                                    try {
+                                        Path relativePathToTarget = currentHtmlFileDirPath.relativize(targetFile.toPath());
+                                        String finalRelPath = relativePathToTarget.toString().replace(File.separatorChar, '/');
+                                        link.attr(attrToChange, finalRelPath);
+                                        modified = true;
+                                        linksRewrittenCount++;
+                                    } catch (IllegalArgumentException e_rel) {
+                                        Log.e(TAG, "Could not relativize path for link: " + absoluteLinkUrl + " in " + currentUrlString + " (target: " + targetFile.getAbsolutePath() + ", base: "+ currentHtmlFileDirPath.toString() +")", e_rel);
+                                        sendUpdateBroadcast("Error relativizing link " + absoluteLinkUrl.substring(0, Math.min(absoluteLinkUrl.length(), 50)) +"... in " + relativePath, STATUS_PROGRESS, null);
+                                    }
                                 }
                             }
+                             if (modified && linksRewrittenCount > 0) {
+                                sendUpdateBroadcast("Finished rewriting " + linksRewrittenCount + " links in: " + relativePath, STATUS_PROGRESS, null);
+                            }
+
+
                             if (isCancelled) { finalStatus = STATUS_CANCELLED; break; }
 
                             if (modified) {
                                 try (FileOutputStream fos = new FileOutputStream(outputFile)) {
                                     fos.write(doc.outerHtml().getBytes("UTF-8"));
-                                    sendUpdateBroadcast("Rewrote links in: " + relativePath, STATUS_PROGRESS, null);
                                 } catch (IOException e_rewrite) {
                                      if (isCancelled) { finalStatus = STATUS_CANCELLED; }
                                      else {
@@ -264,13 +332,30 @@ public class DownloadService extends Service {
                             if (currentDepth < depth) {
                                 for (Element link : links) {
                                     if (isCancelled) { finalStatus = STATUS_CANCELLED; break; }
-                                    String attr = link.hasAttr("href") ? "href" : (link.hasAttr("src") ? "src" : null);
-                                    if (attr == null) continue;
-                                    String originalAbsoluteUrl = link.absUrl(attr);
-                                    // Pass currentIncludeSubdomainsFlag to isValidToFollow
-                                    if (isValidToFollow(originalAbsoluteUrl, url, currentIncludeSubdomainsFlag) && !visitedUrls.contains(originalAbsoluteUrl) && !urlQueue.stream().anyMatch(p -> p.first.equals(originalAbsoluteUrl))) {
-                                        urlQueue.add(new Pair<>(originalAbsoluteUrl, currentDepth + 1));
+                                    String attrKey = "";
+                                     if (link.hasAttr("href")) {
+                                        attrKey = "href";
+                                    } else if (link.hasAttr("src")) {
+                                        attrKey = "src";
+                                    } else if (link.tagName().equals("object") && link.hasAttr("data")) {
+                                        attrKey = "data";
+                                    } else {
+                                        continue;
                                     }
+                                    String originalAbsoluteUrl = link.absUrl(attrKey);
+                                    if (originalAbsoluteUrl.isEmpty()) continue;
+
+                                    if (isValidToFollow(originalAbsoluteUrl, url, currentIncludeSubdomainsFlag)) {
+                                        if (!visitedUrls.contains(originalAbsoluteUrl) && !urlQueue.stream().anyMatch(p -> p.first.equals(originalAbsoluteUrl))) {
+                                            urlQueue.add(new Pair<>(originalAbsoluteUrl, currentDepth + 1));
+                                            newLinksAddedCount++;
+                                        }
+                                    } else {
+                                        sendUpdateBroadcast("Skipping (domain/subdomain constraint): " + originalAbsoluteUrl, STATUS_PROGRESS, null);
+                                    }
+                                }
+                                if (newLinksAddedCount > 0) {
+                                    sendUpdateBroadcast("Found " + newLinksAddedCount + " new links in " + relativePath, STATUS_PROGRESS, null);
                                 }
                             }
                         }
@@ -316,16 +401,17 @@ public class DownloadService extends Service {
                 }
                 String endMessage = "Download process " + finalStatus.toLowerCase() + ".";
                 if (finalStatus.equals(STATUS_ERROR) && finalErrorMessage != null) {
-                    endMessage += " Error: " + finalErrorMessage;
+                    endMessage = "Download Error: " + finalErrorMessage;
                 } else if (finalStatus.equals(STATUS_CANCELLED)){
-                     endMessage = "Download explicitly cancelled by user.";
+                     endMessage = "Download cancelled by user.";
+                } else if (finalStatus.equals(STATUS_COMPLETE)) {
+                    endMessage = "Download completed successfully.";
                 }
                 sendUpdateBroadcast(endMessage, finalStatus, finalErrorMessage);
                 stopSelf(currentStartId);
             }
         });
         downloadThread.start();
-
         return START_NOT_STICKY;
     }
 
@@ -339,75 +425,149 @@ public class DownloadService extends Service {
         sendBroadcast(intent);
     }
 
+    private String formatFileSize(long size) {
+        if (size <= 0) return "0 B";
+        final String[] units = new String[] { "B", "KB", "MB", "GB", "TB" };
+        int digitGroups = (int) (Math.log10(size) / Math.log10(1024));
+        if (digitGroups >= units.length) digitGroups = units.length - 1;
+        return new DecimalFormat("#,##0.#").format(size / Math.pow(1024, digitGroups)) + " " + units[digitGroups];
+    }
+
+    private String sanitizePathComponent(String component) {
+        if (component == null || component.isEmpty()) {
+            return "_";
+        }
+        String sanitized = ILLEGAL_FILENAME_CHARS.matcher(component).replaceAll("_");
+        sanitized = sanitized.trim();
+        while (sanitized.startsWith(".")) {
+            sanitized = sanitized.substring(1).trim();
+        }
+        while (sanitized.endsWith(".")) {
+            sanitized = sanitized.substring(0, sanitized.length() - 1).trim();
+        }
+        if (sanitized.isEmpty()) {
+            return "_";
+        }
+        if (sanitized.length() > MAX_PATH_SEGMENT_LENGTH) {
+            sanitized = sanitized.substring(0, MAX_PATH_SEGMENT_LENGTH);
+        }
+        return sanitized;
+    }
+
+    private String sanitizeFilename(String filename, String extension) {
+        String nameWithoutExtension = filename;
+        if (!TextUtils.isEmpty(extension) && filename.toLowerCase().endsWith("." + extension.toLowerCase())) {
+            nameWithoutExtension = filename.substring(0, filename.length() - (extension.length() + 1));
+        }
+
+        String sanitizedName = ILLEGAL_FILENAME_CHARS.matcher(nameWithoutExtension).replaceAll("_");
+
+        sanitizedName = sanitizedName.trim();
+        while (sanitizedName.startsWith(".")) {
+            sanitizedName = sanitizedName.substring(1).trim();
+        }
+        while (sanitizedName.endsWith(".")) {
+            sanitizedName = sanitizedName.substring(0, sanitizedName.length() - 1).trim();
+        }
+
+        if (sanitizedName.isEmpty()) {
+            sanitizedName = UUID.randomUUID().toString();
+        }
+
+        if (sanitizedName.length() > MAX_FILENAME_LENGTH) {
+            sanitizedName = sanitizedName.substring(0, MAX_FILENAME_LENGTH);
+        }
+        return TextUtils.isEmpty(extension) ? sanitizedName : sanitizedName + "." + extension;
+    }
+
     private String extractRelativePath(String urlString, Response response) {
         URL url;
+        String decodedUrlString = urlString;
         try {
-            url = new URL(urlString);
-        } catch (MalformedURLException e) {
-            Log.e(TAG, "extractRelativePath: Malformed URL " + urlString, e);
-            return "malformed_urls/" + UUID.randomUUID().toString() + ".html";
+            decodedUrlString = URLDecoder.decode(urlString, "UTF-8");
+            url = new URL(decodedUrlString);
+        } catch (MalformedURLException | UnsupportedEncodingException e) {
+            Log.e(TAG, "extractRelativePath: Malformed or un-decodable URL " + urlString, e);
+            try {
+                url = new URL(urlString);
+            } catch (MalformedURLException e2) {
+                 Log.e(TAG, "extractRelativePath: Double Malformed URL " + urlString, e2);
+                 return "malformed_urls/" + sanitizeFilename(UUID.randomUUID().toString(), "html");
+            }
         }
+
         String path = url.getPath();
-        if (path == null || path.isEmpty() || path.equals("/")) {
+        if (path == null) path = "";
+
+        if (path.isEmpty() || path.equals("/")) {
             path = "/index.html";
         } else if (path.endsWith("/")) {
             path += "index.html";
         }
+
         if (path.startsWith("/")) {
             path = path.substring(1);
         }
 
-        File f = new File(path);
-        String name = f.getName();
-        if (name.isEmpty()) {
-            path = (f.getParent() != null ? f.getParent() + File.separator : "") + "index.html";
-            name = "index.html";
-        }
-
-        if (!name.contains(".")) {
-             String contentType = response.header("Content-Type");
-             String extension = null;
-             if (contentType != null) {
-                 extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(contentType.split(";")[0].trim());
-             }
-             if (extension != null) {
-                 path += "." + extension;
-             } else if (contentType != null && contentType.toLowerCase().contains("text/html") && !path.endsWith(".html")) {
-                  path += ".html";
-             }
-        }
-
         String[] pathComponents = path.split("/");
-        StringBuilder sanitizedPath = new StringBuilder();
+        StringBuilder sanitizedRelativePath = new StringBuilder();
+
         for (int i = 0; i < pathComponents.length; i++) {
             String component = pathComponents[i];
-            component = component.replaceAll("[^a-zA-Z0-9._-]+", "_").trim();
-            if (component.isEmpty()) {
-                component = (i == pathComponents.length -1) ? "file" : "dir";
+            if (TextUtils.isEmpty(component)) {
+                if (i < pathComponents.length -1 && pathComponents.length > 1) continue;
+                else component = (i == pathComponents.length - 1 && path.endsWith("index.html")) ? "index.html" : "_empty_segment_";
             }
-            if (component.length() > 64) {
-                component = component.substring(0, 64);
-            }
-            sanitizedPath.append(component);
+
             if (i < pathComponents.length - 1) {
-                sanitizedPath.append(File.separatorChar);
+                sanitizedRelativePath.append(sanitizePathComponent(component));
+            } else {
+                String filename = component;
+                String extension = "";
+                int dotIndex = filename.lastIndexOf('.');
+                if (dotIndex > 0 && dotIndex < filename.length() - 1) {
+                    extension = filename.substring(dotIndex + 1);
+                    filename = filename.substring(0, dotIndex);
+                }
+
+                if (TextUtils.isEmpty(extension)) {
+                    String contentType = response.header("Content-Type");
+                    if (contentType != null) {
+                        String guessedExtension = MimeTypeMap.getSingleton().getExtensionFromMimeType(contentType.split(";")[0].trim());
+                        if (guessedExtension != null) {
+                            extension = guessedExtension;
+                        } else if (contentType.toLowerCase().contains("text/html")) {
+                             extension = "html";
+                        }
+                    }
+                }
+                if (TextUtils.isEmpty(extension) && (path.endsWith("index.html") || !component.contains("."))) {
+                    String contentType = response.header("Content-Type", "");
+                    if(contentType.toLowerCase().contains("text/html")) extension = "html";
+                }
+                filename = sanitizeFilename(filename, extension);
+                sanitizedRelativePath.append(filename);
+            }
+
+            if (i < pathComponents.length - 1) {
+                sanitizedRelativePath.append(File.separatorChar);
             }
         }
-        String resultPath = sanitizedPath.toString();
-        if (resultPath.isEmpty() || resultPath.endsWith(File.separator)) {
-            return "index.html";
+
+        String resultPath = sanitizedRelativePath.toString();
+        if (resultPath.isEmpty() || resultPath.equals(File.separator)) {
+            return sanitizeFilename("default_page", "html");
         }
         return resultPath;
     }
 
-    // Modified isValidToFollow
     private boolean isValidToFollow(String nextUrlString, String initialUrlString, boolean includeSubdomains) {
         if (nextUrlString == null || nextUrlString.trim().isEmpty()) return false;
         try {
             URL nextUrl = new URL(nextUrlString);
             URL initialUrl = new URL(initialUrlString);
 
-            if (!nextUrl.getProtocol().matches("^https?$")) { // Only http/https
+            if (!nextUrl.getProtocol().matches("^https?$")) {
                 return false;
             }
 
@@ -415,7 +575,7 @@ public class DownloadService extends Service {
             String initialHost = initialUrl.getHost();
 
             if (nextHost == null || initialHost == null) {
-                return false; // Should not happen with valid URLs
+                return false;
             }
 
             nextHost = nextHost.toLowerCase();
